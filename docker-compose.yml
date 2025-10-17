@@ -1,0 +1,10 @@
+﻿version: "3.9"
+services:
+  cli:
+    build: .
+    image: rust-gcp-logs-analyzer:local
+    environment:
+      - GCP_PROJECT=${GCP_PROJECT}
+    volumes:
+      - ${GCLOUD_CONFIG_DIR:-${USERPROFILE}\.config\gcloud}:/root/.config/gcloud:ro
+    entrypoint: ["/usr/local/bin/rust-gcp-logs-analyzer"]
