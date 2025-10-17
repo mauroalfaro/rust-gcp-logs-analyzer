@@ -1,0 +1,1 @@
+# rust-gcp-logs-analyzer
