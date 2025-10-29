@@ -1,5 +1,5 @@
 ﻿use anyhow::{anyhow, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use chrono::{DateTime, Duration, Utc};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
@@ -15,7 +15,14 @@ struct Cli {
     command: Commands,
     #[arg(long)]
     project: Option<String>,
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    format: Format,
+    #[arg(long, default_value_t=false)]
+    quiet: bool,
 }
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum Format { Text, Json }
 
 #[derive(Subcommand)]
 enum Commands {
@@ -30,10 +37,18 @@ async fn main() -> Result<()> {
     let project = cli.project.or_else(|| std::env::var("GCP_PROJECT").ok()).ok_or_else(|| anyhow!("project required via --project or GCP_PROJECT"))?;
     let client = Client::builder().build()?;
     match cli.command {
-        Commands::Fetch { filter, start, end, json } => fetch(&client, &project, filter.as_deref(), start.as_deref(), end.as_deref(), json).await?,
-        Commands::Tail { filter, json } => tail(&client, &project, filter.as_deref(), json).await?,
-        Commands::Insights { query, start, end, json } => insights(&client, &project, &query, start.as_deref(), end.as_deref(), json).await?,
-        Commands::Fetch { filter:_, start:_, end:_, json:_, page_size:_ } => unreachable!(),
+        Commands::Fetch { filter, start, end, json, page_size } => {
+            let jsonl = matches!(cli.format, Format::Json) || json;
+            fetch(&client, &project, filter.as_deref(), start.as_deref(), end.as_deref(), jsonl, page_size, cli.quiet).await?
+        }
+        Commands::Tail { filter, json } => {
+            let jsonl = matches!(cli.format, Format::Json) || json;
+            tail(&client, &project, filter.as_deref(), jsonl, cli.quiet).await?
+        }
+        Commands::Insights { query, start, end, json } => {
+            let jsonl = matches!(cli.format, Format::Json) || json;
+            insights(&client, &project, &query, start.as_deref(), end.as_deref(), jsonl).await?
+        }
     }
     Ok(())
 }
@@ -57,13 +72,19 @@ fn parse_rel(s: &str) -> Result<Duration> {
     Ok(d)
 }
 
-async fn fetch(client: &Client, project: &str, filter: Option<&str>, start: Option<&str>, end: Option<&str>, jsonl: bool) -> Result<()> {
+async fn fetch(client: &Client, project: &str, filter: Option<&str>, start: Option<&str>, end: Option<&str>, jsonl: bool, page_size: i32, quiet: bool) -> Result<()> {
     let scope = ["https://www.googleapis.com/auth/logging.read"]; let tok = token(&scope).await?;
     let start_ms = parse_time_arg(start)?; let end_ms = parse_time_arg(end)?;
-    let pb = ProgressBar::new_spinner(); pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap()); pb.enable_steady_tick(100); pb.set_message("fetching");
+    let pb = if quiet { None } else {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
+        pb.enable_steady_tick(100);
+        pb.set_message("fetching");
+        Some(pb)
+    };
     let mut page_token: Option<String> = None;
     loop {
-        let mut body = json!({"resourceNames":[format!("projects/{}", project)],"pageSize":1000});
+        let mut body = json!({"resourceNames":[format!("projects/{}", project)],"pageSize":page_size});
         if let Some(f) = filter { body["filter"] = json!(f); }
         if let Some(s) = start_ms { body["startTime"] = json!(format!("{}Z", DateTime::<Utc>::from_timestamp_millis(s).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Millis, true))); }
         if let Some(e) = end_ms { body["endTime"] = json!(format!("{}Z", DateTime::<Utc>::from_timestamp_millis(e).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Millis, true))); }
@@ -74,14 +95,14 @@ async fn fetch(client: &Client, project: &str, filter: Option<&str>, start: Opti
         page_token = val.get("nextPageToken").and_then(|v| v.as_str()).map(|s| s.to_string());
         if page_token.is_none() { break; }
     }
-    pb.finish_and_clear();
+    if let Some(pb) = pb { pb.finish_and_clear(); }
     Ok(())
 }
 
-async fn tail(client: &Client, project: &str, filter: Option<&str>, jsonl: bool) -> Result<()> {
+async fn tail(client: &Client, project: &str, filter: Option<&str>, jsonl: bool, _quiet: bool) -> Result<()> {
     let mut start = Some((Utc::now() - Duration::seconds(10)).to_rfc3339());
     loop {
-        fetch(client, project, filter, start.as_deref(), None, jsonl).await?;
+        fetch(client, project, filter, start.as_deref(), None, jsonl, 1000, true).await?;
         start = Some(Utc::now().to_rfc3339());
         sleep(StdDuration::from_millis(1500)).await;
     }
